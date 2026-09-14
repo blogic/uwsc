@@ -42,16 +42,28 @@ Establishes a WebSocket connection to the specified URL.
 - `options` (object, optional):
   - `connection_timeout` (number): Connection timeout in milliseconds (default: 30000)
   - `ping_timeout` (number): Ping interval in milliseconds (default: 15000)
-  - `reconnect_timeout` (number): Reconnect interval in milliseconds (default: 5000)
+  - `idle_timeout` (number): Milliseconds of inbound silence before the
+    connection is torn down (default: 60000). An explicit `0` disables the
+    timer entirely.
+  - `reconnect_timeout` (number): Reconnect interval in milliseconds
+    (default: 0, meaning automatic reconnection is **disabled**). Set a
+    non-zero value to enable it.
   - `ssl_verify` (bool): Verify SSL certificates (default: true)
-  - `ca_cert` (string): Path to custom CA certificate for self-signed servers
+  - `ca_cert` (string): Path to custom CA certificate **file** for self-signed
+    servers. Setting it also skips hostname verification.
   - `protocol` (string): WebSocket subprotocol to negotiate
   - `user_agent` (string): User-Agent header (default: "uwsc/1.0")
   - `on_connect` (function): Called when connection is established
   - `on_reconnect` (function): Called when connection is re-established after disconnect
-  - `on_disconnect` (function): Called when connection is closed
+  - `on_disconnect` (function): Called when connection is closed, including on
+    a close initiated by the server
   - `on_error` (function): Called on errors with error message
   - `on_recv` (function): Called when message is received with message object
+  - `on_drain` (function): Called when the send buffer has been fully flushed
+
+Every option is type checked and a mismatch makes `connect()` return `null`
+without further explanation, so pass integers (not floats) for the timeouts and
+real booleans for `ssl_verify`.
 
 **Returns:** Connection object or null on failure
 
@@ -68,12 +80,19 @@ Establishes a WebSocket connection to the specified URL.
 Sends a message through the WebSocket connection.
 
 **Parameters:**
-- `data` (string): Message to send
+- `data` (string): Message to send. ucode strings carry their own length, so
+  arbitrary binary payloads including embedded NUL bytes are sent intact. An
+  object or array is serialised to JSON instead.
 - `binary` (bool, optional): Send as binary frame (default: false for text)
 
 **Returns:** true on success, false on failure
 
 **Note:** Large messages (>16KB) are automatically fragmented into smaller chunks.
+
+**Note:** The outgoing buffer is a fixed 64KB. A producer faster than the socket
+should watch `connection.pending()` and resume from the `on_drain` callback
+rather than relying on the `false` return, which arrives only once bytes have
+already been refused.
 
 #### connection.close(code, reason)
 
@@ -102,6 +121,29 @@ Synchronously receives a message (blocking operation).
 Checks if connection is in connected state.
 
 **Returns:** true if connected, false otherwise
+
+#### connection.pending()
+
+Gets the number of bytes sitting unflushed in the send buffer.
+
+**Returns:** Byte count, 0 when the buffer is empty or there is no connection.
+
+Together with the `on_drain` callback this is the backpressure signal for a
+producer that can outrun the socket:
+
+```javascript
+let conn = ws.connect(url, {
+    on_recv: ...,
+    on_drain: function(conn) {
+        source_resume();
+    }
+});
+
+// in the producer
+conn.send(chunk, true);
+if (conn.pending() > 32768)
+    source_pause();
+```
 
 ## Examples
 

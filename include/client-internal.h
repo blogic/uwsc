@@ -183,6 +183,7 @@ __hidden bool uwsc_ucode_on_connect(uwsc_client_t *client);
 __hidden bool uwsc_ucode_on_disconnect(uwsc_client_t *client);
 __hidden bool uwsc_ucode_on_error(uwsc_client_t *client, const char *error);
 __hidden bool uwsc_ucode_on_recv(uwsc_client_t *client, const char *data, size_t len, bool binary);
+__hidden bool uwsc_ucode_on_drain(uwsc_client_t *client);
 
 /* Send buffer management */
 __hidden void uwsc_client_send_buffer_init(uwsc_client_t *client);

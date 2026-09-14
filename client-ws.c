@@ -340,6 +340,25 @@ uwsc_client_ws_send_close(uwsc_client_t *client, uint16_t code, const char *reas
 	return uwsc_client_ws_send_frame(client, UWSC_OPCODE_CLOSE, payload, len, true);
 }
 
+/* Status code to echo in the close response. 1005, 1006 and 1015 are codes an
+ * application may observe but that must never travel on the wire, so a peer
+ * sending one gets a plain normal-closure back. */
+static uint16_t
+uwsc_client_ws_close_echo_code(const uint8_t *payload, size_t len)
+{
+	uint16_t code;
+
+	if (len < 2)
+		return 1000;
+
+	code = ((uint16_t)payload[0] << 8) | payload[1];
+
+	if (code == 1005 || code == 1006 || code == 1015)
+		return 1000;
+
+	return code;
+}
+
 static void
 unmask_payload(uint8_t *data, size_t len, const uint8_t mask[4])
 {
@@ -367,6 +386,11 @@ uwsc_client_process_ws_frame(uwsc_client_t *client, uwsc_ws_opcode_t opcode,
 
 		case UWSC_OPCODE_CLOSE:
 			uwsc_log_debug(NULL, "WebSocket close frame received");
+			/* RFC 6455 5.5.1 requires a close frame in response, and it
+			 * has to go out before the state change below: the send path
+			 * only accepts frames while the client is CONNECTED. */
+			uwsc_client_ws_send_close(client,
+				uwsc_client_ws_close_echo_code(payload, len), NULL);
 			uwsc_client_set_state(client, UWSC_CLIENT_STATE_CLOSING);
 			break;
 
@@ -706,6 +730,7 @@ uwsc_client_ws_cb(struct uloop_fd *ufd, unsigned int events)
 {
 	uwsc_client_t *client = container_of(ufd, uwsc_client_t, conn.ufd);
 	bool prev_in_callback;
+	bool drain_exit;
 
 	/* Abort if uloop is shutting down */
 	if (uloop_cancelling())
@@ -720,6 +745,14 @@ uwsc_client_ws_cb(struct uloop_fd *ufd, unsigned int events)
 		/* If buffer is now empty, stop watching for write events */
 		if (uwsc_client_send_buffer_pending(client) == 0) {
 			uloop_fd_add(&client->conn.ufd, ULOOP_READ);
+
+			prev_in_callback = client->in_callback;
+			client->in_callback = true;
+			drain_exit = uwsc_ucode_on_drain(client);
+			client->in_callback = prev_in_callback;
+
+			if (drain_exit || client->state != UWSC_CLIENT_STATE_CONNECTED)
+				return;
 		}
 	}
 
@@ -744,6 +777,16 @@ uwsc_client_ws_cb(struct uloop_fd *ufd, unsigned int events)
 		;
 
 	client->in_callback = prev_in_callback;
+
+	/* A CLOSE frame from the server leaves the client in CLOSING with the fd
+	 * still armed, and nothing else reports that disconnect. */
+	if (client->state == UWSC_CLIENT_STATE_CLOSING) {
+		/* The close response queued by the frame handler may still be
+		 * sitting in the send buffer, and the fd is about to go away. */
+		uwsc_client_send_buffer_flush(client);
+		uloop_fd_delete(&client->conn.ufd);
+		uwsc_ucode_on_disconnect(client);
+	}
 }
 
 /* Whether conn->buf holds a complete frame that can be processed without

@@ -102,6 +102,7 @@ enum {
 	SLOT_ON_DISCONNECT,
 	SLOT_ON_ERROR,
 	SLOT_ON_RECV,
+	SLOT_ON_DRAIN,
 	SLOT_MAX
 };
 
@@ -280,6 +281,17 @@ uwsc_ucode_on_recv(uwsc_client_t *client, const char *data, size_t len, bool bin
 	return uwsc_ws_callback_call(conn, SLOT_ON_RECV, msg_obj);
 }
 
+__hidden bool
+uwsc_ucode_on_drain(uwsc_client_t *client)
+{
+	uwsc_ws_connection_t *conn = client->ucode_ctx;
+
+	if (exit_in_progress || !conn)
+		return false;
+
+	return uwsc_ws_callback_call(conn, SLOT_ON_DRAIN, NULL);
+}
+
 
 static void
 attempt_connection(uwsc_ws_connection_t *conn)
@@ -337,6 +349,7 @@ static uc_value_t *uc_ws_connect(uc_vm_t *vm, size_t nargs)
 	uc_value_t *url_val, *config_obj, *obj;
 	uc_value_t *timeout_val, *ssl_verify_val, *user_agent_val, *protocol_val;
 	uc_value_t *on_connect_val, *on_reconnect_val, *on_disconnect_val, *on_error_val, *on_recv_val;
+	uc_value_t *on_drain_val = NULL;
 	uwsc_ws_connection_t *conn;
 	const char *url, *proto, *user_agent;
 
@@ -364,7 +377,8 @@ static uc_value_t *uc_ws_connect(uc_vm_t *vm, size_t nargs)
 			"on_reconnect", UC_CLOSURE, OPTIONAL, &on_reconnect_val,
 			"on_disconnect", UC_CLOSURE, OPTIONAL, &on_disconnect_val,
 			"on_error", UC_CLOSURE, OPTIONAL, &on_error_val,
-			"on_recv", UC_CLOSURE, OPTIONAL, &on_recv_val);
+			"on_recv", UC_CLOSURE, OPTIONAL, &on_recv_val,
+			"on_drain", UC_CLOSURE, OPTIONAL, &on_drain_val);
 	}
 
 	url = ucv_string_get(url_val);
@@ -439,6 +453,9 @@ static uc_value_t *uc_ws_connect(uc_vm_t *vm, size_t nargs)
 	if (on_recv_val)
 		ucv_resource_value_set(obj, SLOT_ON_RECV, ucv_get(on_recv_val));
 
+	if (on_drain_val)
+		ucv_resource_value_set(obj, SLOT_ON_DRAIN, ucv_get(on_drain_val));
+
 	/* uloop drives the connection from here on; the script may drop its
 	 * reference, so shield the resource from the GC */
 	ucv_resource_persistent_set(obj, true);
@@ -468,12 +485,16 @@ static uc_value_t *uc_ws_send(uc_vm_t *vm, size_t nargs)
 	/* Check if data_val is a string */
 	data = ucv_string_get(data_val);
 
+	if (data) {
+		len = ucv_string_length(data_val);
+	}
 	/* If not a string, check if it's an object or array and convert to JSON */
-	if (!data) {
+	else {
 		if (ucv_type(data_val) == UC_OBJECT || ucv_type(data_val) == UC_ARRAY) {
 			json_str = ucv_to_jsonstring(vm, data_val);
 			if (json_str) {
 				data = json_str;
+				len = strlen(json_str);
 			}
 		}
 	}
@@ -481,7 +502,6 @@ static uc_value_t *uc_ws_send(uc_vm_t *vm, size_t nargs)
 	if (!data)
 		return ucv_boolean_new(false);
 
-	len = strlen(data);
 	if (binary_val)
 		binary = ucv_boolean_get(binary_val);
 
@@ -579,6 +599,17 @@ static uc_value_t *uc_ws_is_connected(uc_vm_t *vm, size_t nargs)
 	return ucv_boolean_new(uwsc_client_get_state(conn->client) == UWSC_CLIENT_STATE_CONNECTED);
 }
 
+static uc_value_t *uc_ws_pending(uc_vm_t *vm, size_t nargs)
+{
+	uwsc_ws_connection_t *conn;
+
+	conn = uc_fn_thisval("uwsc.connection");
+	if (!conn || !conn->client)
+		return ucv_uint64_new(0);
+
+	return ucv_uint64_new(uwsc_client_send_buffer_pending(conn->client));
+}
+
 static const uc_function_list_t ws_module_functions[] = {
 	{ "connect", uc_ws_connect }
 };
@@ -588,7 +619,8 @@ static const uc_function_list_t ws_connection_methods[] = {
 	{ "receive", uc_ws_receive },
 	{ "close", uc_ws_close },
 	{ "state", uc_ws_state },
-	{ "is_connected", uc_ws_is_connected }
+	{ "is_connected", uc_ws_is_connected },
+	{ "pending", uc_ws_pending }
 };
 
 void uc_module_entry(uc_vm_t *vm, uc_value_t *scope) __attribute__((used));
