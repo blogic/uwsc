@@ -145,6 +145,30 @@ if (conn.pending() > 32768)
     source_pause();
 ```
 
+## Connection lifetime
+
+`connect()` pins the connection so uloop can keep driving it after the script
+drops its reference. A script may therefore ignore the return value entirely
+and still receive callbacks.
+
+`close()` releases that pin. After it, the connection lives exactly as long as
+the script's own references to it, and is reclaimed once those go. A closed
+connection never connects or reconnects again, including when `close()` is
+called before the initial connect has run or while a reconnect is pending.
+
+The release is deferred to the next event loop iteration, because `close()` is
+commonly called from inside a callback whose C frames are still using the
+connection. A closed connection object stays safe to call: `state()`,
+`pending()` and `is_connected()` keep working, and `send()` returns false.
+
+`close()` releases the pin even when there is nothing left to shut down, such
+as a connection abandoned before it finished connecting, or one whose client an
+error has already torn down. It returns false in those cases, but the release
+still happens.
+
+A connection that is never explicitly closed stays pinned. Call `close()` when
+you are finished with one.
+
 ## Examples
 
 ### Basic Echo Client

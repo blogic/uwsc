@@ -110,11 +110,13 @@ typedef struct {
 	uwsc_client_t *client;
 	struct uloop_timeout connect_timer;
 	struct uloop_timeout reconnect_timer;
+	struct uloop_timeout release_timer;
 	char *url;
 	uwsc_client_config_t config;
 	uc_vm_t *vm;
 	uc_value_t *res_obj;
 	bool is_reconnecting;
+	bool closed;
 } uwsc_ws_connection_t;
 
 static void start_reconnect_timer(uwsc_ws_connection_t *conn);
@@ -131,6 +133,7 @@ uwsc_ws_connection_free(void *ptr)
 
 	uloop_timeout_cancel(&conn->connect_timer);
 	uloop_timeout_cancel(&conn->reconnect_timer);
+	uloop_timeout_cancel(&conn->release_timer);
 	free(conn->url);
 
 	if (conn->config.protocols) {
@@ -152,11 +155,20 @@ uwsc_ws_connection_free(void *ptr)
 static bool
 uwsc_ws_callback_call(uwsc_ws_connection_t *conn, size_t slot, uc_value_t *arg)
 {
-	uc_value_t *callback = ucv_resource_value_get(conn->res_obj, slot);
 	bool prev_in_callback = false;
+	uc_value_t *callback;
 	int nargs = 1;
 
-	if (!conn->vm || !callback || !ucv_is_callable(callback)) {
+	/* res_obj is cleared once an explicitly closed connection is released;
+	 * ucv_resource_value_get() would dereference the null */
+	if (!conn->vm || !conn->res_obj) {
+		ucv_put(arg);
+		return false;
+	}
+
+	callback = ucv_resource_value_get(conn->res_obj, slot);
+
+	if (!callback || !ucv_is_callable(callback)) {
 		ucv_put(arg);
 		return false;
 	}
@@ -323,6 +335,11 @@ attempt_connection(uwsc_ws_connection_t *conn)
 static void
 start_reconnect_timer(uwsc_ws_connection_t *conn)
 {
+	/* close() may run inside on_error or on_disconnect, whose callers arm
+	 * the reconnect after the callback returns */
+	if (conn->closed)
+		return;
+
 	if (conn->config.reconnect_timeout > 0) {
 		conn->is_reconnecting = true;
 		conn->reconnect_timer.cb = reconnect_cb;
@@ -342,6 +359,28 @@ deferred_connect_cb(struct uloop_timeout *timer)
 {
 	uwsc_ws_connection_t *conn = container_of(timer, uwsc_ws_connection_t, connect_timer);
 	attempt_connection(conn);
+}
+
+/* Undo what uc_ws_connect() pinned. Both halves have to go: `persistent` keeps
+ * the resource in the GC root set, and res_obj is a self-reference that on its
+ * own holds the refcount above zero, so releasing either alone leaks.
+ *
+ * This runs from a timeout rather than directly from close() because close()
+ * is commonly called from inside a callback, whose C frames are still
+ * dereferencing the client. By the time a uloop timeout fires, that stack has
+ * unwound. Nothing may touch conn after the put: it may be freed there. */
+static void
+release_cb(struct uloop_timeout *timer)
+{
+	uwsc_ws_connection_t *conn = container_of(timer, uwsc_ws_connection_t, release_timer);
+	uc_value_t *obj = conn->res_obj;
+
+	if (!obj)
+		return;
+
+	conn->res_obj = NULL;
+	ucv_resource_persistent_set(obj, false);
+	ucv_put(obj);
 }
 
 static uc_value_t *uc_ws_connect(uc_vm_t *vm, size_t nargs)
@@ -523,7 +562,7 @@ static uc_value_t *uc_ws_close(uc_vm_t *vm, size_t nargs)
 	int ret;
 
 	conn = uc_fn_thisval("uwsc.connection");
-	if (!conn || !conn->client)
+	if (!conn)
 		return ucv_boolean_new(false);
 
 	if (code_val)
@@ -532,7 +571,26 @@ static uc_value_t *uc_ws_close(uc_vm_t *vm, size_t nargs)
 	if (reason_val)
 		reason = ucv_string_get(reason_val);
 
+	conn->closed = true;
+	uloop_timeout_cancel(&conn->connect_timer);
+	uloop_timeout_cancel(&conn->reconnect_timer);
+
+	/* An explicitly closed connection is finished with; drop the pin that
+	 * keeps it alive so the runtime can reclaim it once the script lets go.
+	 * Deferred, see release_cb().
+	 *
+	 * This happens whether or not there is a live client to close. A
+	 * connection closed before its deferred connect ran, or one whose
+	 * client an error already destroyed, has nothing to shut down but is
+	 * still pinned. */
+	conn->release_timer.cb = release_cb;
+	uloop_timeout_set(&conn->release_timer, 0);
+
+	if (!conn->client)
+		return ucv_boolean_new(false);
+
 	ret = uwsc_client_close(conn->client, code, reason);
+
 	return ucv_boolean_new(ret == 0);
 }
 
