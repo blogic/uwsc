@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <arpa/inet.h>
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -77,6 +78,22 @@ static const char *
 uwsc_ssl_get_verify_error_string(long verify_result)
 {
 	return X509_verify_cert_error_string(verify_result);
+}
+
+/* Expect the peer certificate to name host: an IP address literal is matched
+ * against the certificate's IP address entries, anything else as a DNS name */
+static bool
+uwsc_ssl_set_peer_name(SSL *ssl, const char *host)
+{
+	X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+	unsigned char addr[sizeof(struct in6_addr)];
+
+	if (inet_pton(AF_INET, host, addr) == 1 || inet_pton(AF_INET6, host, addr) == 1)
+		return X509_VERIFY_PARAM_set1_ip_asc(param, host) == 1;
+
+	X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+
+	return SSL_set1_host(ssl, host) == 1;
 }
 
 __hidden bool
@@ -143,6 +160,17 @@ uwsc_ssl_create_client(uwsc_client_t *client)
 	/* Set verification mode based on configuration */
 	if (client->ssl_verify) {
 		SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+
+		/* The certificate must name the host we dialled. OpenSSL checks
+		 * this inside the handshake, so it holds whether the handshake
+		 * completes at once or later on the nonblocking socket, and with
+		 * a custom CA as well as the system store. */
+		if (client->host && !uwsc_ssl_set_peer_name(ssl, client->host)) {
+			uwsc_log_err(NULL, "Failed to set the expected peer name %s", client->host);
+			SSL_free(ssl);
+			SSL_CTX_free(ssl_ctx);
+			return NULL;
+		}
 	} else {
 		SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
 	}
@@ -171,45 +199,15 @@ uwsc_ssl_connect(struct uwsc_connection *conn)
 
 	/* Log detailed SSL error */
 	const char *error_str = uwsc_ssl_get_error_string(ssl, ret);
-	uwsc_log_err(NULL, "SSL handshake failed: %s", error_str);
+	long verify_result = SSL_get_verify_result(ssl);
+
+	if (verify_result != X509_V_OK)
+		uwsc_log_err(NULL, "SSL handshake failed: certificate verification: %s",
+			     uwsc_ssl_get_verify_error_string(verify_result));
+	else
+		uwsc_log_err(NULL, "SSL handshake failed: %s", error_str);
 
 	return -1; /* Error */
-}
-
-__hidden bool
-uwsc_ssl_verify_peer(uwsc_client_t *client)
-{
-	SSL *ssl;
-	X509 *cert;
-	long verify_result;
-
-	if (!client || !client->conn.ssl)
-		return false;
-
-	ssl = (SSL *)client->conn.ssl;
-
-	verify_result = SSL_get_verify_result(ssl);
-	if (verify_result != X509_V_OK) {
-		const char *verify_error = uwsc_ssl_get_verify_error_string(verify_result);
-		uwsc_log_err(NULL, "Certificate verification failed: %s", verify_error);
-		return false;
-	}
-
-	cert = SSL_get_peer_certificate(ssl);
-	if (!cert) {
-		uwsc_log_err(NULL, "No peer certificate presented");
-		return false;
-	}
-
-	/* Verify hostname if provided */
-	if (client->host) {
-		int match = X509_check_host(cert, client->host, strlen(client->host), 0, NULL);
-		X509_free(cert);
-		return match == 1;
-	}
-
-	X509_free(cert);
-	return true;
 }
 
 __hidden ssize_t
@@ -372,13 +370,6 @@ uwsc_client_ssl_connect(uwsc_client_t *client)
 	else if (ret == 0) {
 		uwsc_log_debug(NULL, "SSL connect would block, continuing asynchronously");
 		return true;
-	}
-
-	/* Additional hostname verification if ssl_verify is enabled */
-	/* Skip hostname verification when using custom CA (for self-signed certs) */
-	if (client->ssl_verify && !client->ca_cert_path && !uwsc_ssl_verify_peer(client)) {
-		uwsc_log_err(NULL, "SSL certificate hostname verification failed for %s", client->host);
-		return false;
 	}
 
 	uwsc_log_debug(NULL, "SSL handshake completed successfully");

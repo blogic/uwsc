@@ -29,7 +29,6 @@ struct uwsc_client;
 __hidden bool uwsc_ssl_init_client_ctx(void);
 __hidden void *uwsc_ssl_create_client(struct uwsc_client *client);
 __hidden int uwsc_ssl_connect(struct uwsc_connection *);
-__hidden bool uwsc_ssl_verify_peer(struct uwsc_client *client);
 __hidden void uwsc_ssl_free(struct uwsc_connection *);
 
 __hidden ssize_t uwsc_ssl_pending(struct uwsc_connection *);
